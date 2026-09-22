@@ -1,0 +1,16 @@
+{
+  "name": "gamehub-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GameHub signaling server",
+  "main": "signaling.cjs",
+  "scripts": {
+    "start": "node signaling.cjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
