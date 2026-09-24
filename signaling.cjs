@@ -13,11 +13,14 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-/** @type {Map<string, { ws: any, room: string|null, user: string }>} */
+/** @type {Map<string, { ws: any, room: string|null, user: string, joinedAt: number }>} */
 const clients = new Map();
 
 /** @type {Map<string, Array<any>>} */
 const roomHistory = new Map();
+
+/** @type {Map<string, string>} sala → id do host */
+const roomHosts = new Map();
 
 let nextId = 1;
 
@@ -47,7 +50,8 @@ function roomsSummary() {
   const presence = presenceSnapshot();
   return Object.entries(presence).map(([name, users]) => ({
     name,
-    count: users.length
+    count: users.length,
+    host: roomHosts.get(name) || null,
   }));
 }
 
@@ -76,6 +80,24 @@ function pushHistory(room, msg) {
   if (list.length > MAX_HISTORY) list.shift();
 }
 
+function recalcHost(room) {
+  const candidates = [];
+  for (const [id, c] of clients) {
+    if (c.room === room) candidates.push({ id, joinedAt: c.joinedAt });
+  }
+  if (candidates.length === 0) {
+    roomHosts.delete(room);
+    return null;
+  }
+  const currentHostId = roomHosts.get(room);
+  if (currentHostId && candidates.some(c => c.id === currentHostId)) return currentHostId;
+  candidates.sort((a, b) => a.joinedAt - b.joinedAt);
+  const newHostId = candidates[0].id;
+  roomHosts.set(room, newHostId);
+  notifyRoom(room, null, { type: "host-changed", hostId: newHostId });
+  return newHostId;
+}
+
 function leaveRoom(id, broadcast = true) {
   const me = clients.get(id);
   if (!me || !me.room) return null;
@@ -85,20 +107,21 @@ function leaveRoom(id, broadcast = true) {
   me.room = null;
   notifyRoom(prevRoom, id, { type: "peer-left", id });
 
+  if (roomHosts.get(prevRoom) === id) recalcHost(prevRoom);
+
   if (broadcast) broadcastPresence();
   return prevRoom;
 }
 
 wss.on("connection", (ws) => {
   const id = String(nextId++);
-
-  clients.set(id, { ws, room: null, user: `User-${id}` });
+  clients.set(id, { ws, room: null, user: `User-${id}`, joinedAt: Date.now() });
 
   safeSend(ws, {
     type: "welcome",
     id,
     rooms: roomsSummary(),
-    presence: presenceSnapshot()
+    presence: presenceSnapshot(),
   });
 
   ws.on("message", (raw) => {
@@ -123,8 +146,16 @@ wss.on("connection", (ws) => {
 
       if (me.room && me.room !== room) leaveRoom(id, false);
 
+      const isNewRoom = !roomHosts.has(room) ||
+        !Array.from(clients.values()).some(c => c.room === room && c !== me);
+
       me.room = room;
       me.user = user;
+      me.joinedAt = Date.now();
+
+      if (isNewRoom || !roomHosts.get(room)) {
+        roomHosts.set(room, id);
+      }
 
       safeSend(ws, {
         type: "welcome",
@@ -132,25 +163,22 @@ wss.on("connection", (ws) => {
         room,
         peers: peersInRoom(room, id),
         rooms: roomsSummary(),
-        presence: presenceSnapshot()
+        presence: presenceSnapshot(),
+        isHost: roomHosts.get(room) === id,
+        hostId: roomHosts.get(room),
       });
 
-      safeSend(ws, {
-        type: "chat-history",
-        room,
-        messages: getHistory(room)
-      });
+      safeSend(ws, { type: "chat-history", room, messages: getHistory(room) });
 
       notifyRoom(room, id, { type: "peer-joined", id, user });
-      console.log(`[+] ${user} (${id}) entrou em "${room}"`);
+      notifyRoom(room, id, { type: "host-changed", hostId: roomHosts.get(room) });
+
+      console.log(`[+] ${user} (${id}) entrou em "${room}" (host: ${roomHosts.get(room)})`);
       broadcastPresence();
       return;
     }
 
-    if (msg.type === "leave") {
-      leaveRoom(id, true);
-      return;
-    }
+    if (msg.type === "leave") { leaveRoom(id, true); return; }
 
     if (msg.type === "signal") {
       const target = clients.get(String(msg.to));
@@ -163,7 +191,6 @@ wss.on("connection", (ws) => {
       const room = me.room;
       if (!room) return;
       const text = String(msg.text || "").slice(0, MAX_TEXT_LEN).trim();
-
       let image = undefined;
       if (msg.image && typeof msg.image === "object") {
         const data = String(msg.image.data || "");
@@ -175,30 +202,50 @@ wss.on("connection", (ws) => {
           return safeSend(ws, { type: "error", message: "Imagem grande demais." });
         }
       }
-
       if (!text && !image) return;
-
       const entry = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        userId: id,
-        user: me.user,
-        text,
-        at: Date.now(),
+        userId: id, user: me.user, text, at: Date.now(),
         ...(image ? { image } : {}),
       };
       pushHistory(room, entry);
+      for (const [, c] of clients) if (c.room === room) safeSend(c.ws, { type: "chat", message: entry });
+      return;
+    }
 
-      for (const [, c] of clients) {
-        if (c.room === room) safeSend(c.ws, { type: "chat", message: entry });
+    // ===== Comandos de host =====
+
+    if (msg.type === "kick") {
+      if (!me.room) return;
+      if (roomHosts.get(me.room) !== id) {
+        return safeSend(ws, { type: "error", message: "Só o host pode expulsar." });
       }
+      const targetId = String(msg.targetId || "");
+      const target = clients.get(targetId);
+      if (!target || target.room !== me.room) {
+        return safeSend(ws, { type: "error", message: "Participante não encontrado." });
+      }
+      if (targetId === id) {
+        return safeSend(ws, { type: "error", message: "Você não pode se expulsar." });
+      }
+      safeSend(target.ws, { type: "kicked", reason: "Você foi expulso pelo host." });
+      leaveRoom(targetId, true);
+      return;
+    }
+
+    if (msg.type === "mute-all") {
+      if (!me.room) return;
+      if (roomHosts.get(me.room) !== id) {
+        return safeSend(ws, { type: "error", message: "Só o host pode mutar todos." });
+      }
+      const value = !!msg.value;
+      notifyRoom(me.room, null, { type: "host-mute-all", value, by: me.user });
       return;
     }
 
     if (msg.type === "share-started") {
       notifyRoom(me.room, id, {
-        type: "share-started",
-        from: id,
-        user: me.user,
+        type: "share-started", from: id, user: me.user,
         quality: msg.quality || "720p30",
         hasAudio: !!msg.hasAudio,
         sourceKind: msg.sourceKind === "window" ? "window" : "screen"
