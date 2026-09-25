@@ -22,6 +22,9 @@ const roomHistory = new Map();
 /** @type {Map<string, string>} sala → id do host */
 const roomHosts = new Map();
 
+/** @type {Map<string, Set<string>>} sala → ids mutados */
+const roomMuted = new Map();
+
 let nextId = 1;
 
 function safeSend(ws, obj) {
@@ -52,6 +55,7 @@ function roomsSummary() {
     name,
     count: users.length,
     host: roomHosts.get(name) || null,
+    mutedIds: Array.from(roomMuted.get(name) || []),
   }));
 }
 
@@ -107,6 +111,10 @@ function leaveRoom(id, broadcast = true) {
   me.room = null;
   notifyRoom(prevRoom, id, { type: "peer-left", id });
 
+  // Remove da lista de mutados se estava
+  const mutedSet = roomMuted.get(prevRoom);
+  if (mutedSet) mutedSet.delete(id);
+
   if (roomHosts.get(prevRoom) === id) recalcHost(prevRoom);
 
   if (broadcast) broadcastPresence();
@@ -157,6 +165,10 @@ wss.on("connection", (ws) => {
         roomHosts.set(room, id);
       }
 
+      // Garante que o Set de muted existe
+      if (!roomMuted.has(room)) roomMuted.set(room, new Set());
+      const isMuted = roomMuted.get(room).has(id);
+
       safeSend(ws, {
         type: "welcome",
         id,
@@ -166,6 +178,7 @@ wss.on("connection", (ws) => {
         presence: presenceSnapshot(),
         isHost: roomHosts.get(room) === id,
         hostId: roomHosts.get(room),
+        hostMuted: isMuted,
       });
 
       safeSend(ws, { type: "chat-history", room, messages: getHistory(room) });
@@ -233,13 +246,60 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // === Silenciar um peer específico (individual) ===
+    if (msg.type === "mute-peer") {
+      if (!me.room) return;
+      if (roomHosts.get(me.room) !== id) {
+        return safeSend(ws, { type: "error", message: "Só o host pode silenciar outros." });
+      }
+      const targetId = String(msg.targetId || "");
+      const target = clients.get(targetId);
+      if (!target || target.room !== me.room) {
+        return safeSend(ws, { type: "error", message: "Participante não encontrado." });
+      }
+      const value = !!msg.value;
+      const set = roomMuted.get(me.room) || new Set();
+      if (value) set.add(targetId);
+      else set.delete(targetId);
+      roomMuted.set(me.room, set);
+
+      // Avisa todos os da sala (inclusive o mutado)
+      notifyRoom(me.room, null, {
+        type: "peer-muted",
+        targetId,
+        value,
+        by: me.user,
+      });
+      return;
+    }
+
+    // === Mute all (botão de toolbar) ===
     if (msg.type === "mute-all") {
       if (!me.room) return;
       if (roomHosts.get(me.room) !== id) {
         return safeSend(ws, { type: "error", message: "Só o host pode mutar todos." });
       }
       const value = !!msg.value;
-      notifyRoom(me.room, null, { type: "host-mute-all", value, by: me.user });
+      const set = roomMuted.get(me.room) || new Set();
+      for (const [otherId, c] of clients) {
+        if (c.room === me.room && otherId !== id) {
+          if (value) set.add(otherId);
+          else set.delete(otherId);
+        }
+      }
+      roomMuted.set(me.room, set);
+
+      // Avisa individualmente cada peer mutado
+      for (const [otherId, c] of clients) {
+        if (c.room === me.room && otherId !== id) {
+          safeSend(c.ws, {
+            type: "peer-muted",
+            targetId: otherId,
+            value,
+            by: me.user,
+          });
+        }
+      }
       return;
     }
 
