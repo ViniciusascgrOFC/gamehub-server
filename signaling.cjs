@@ -13,16 +13,9 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-/** @type {Map<string, { ws: any, room: string|null, user: string, joinedAt: number }>} */
 const clients = new Map();
-
-/** @type {Map<string, Array<any>>} */
 const roomHistory = new Map();
-
-/** @type {Map<string, string>} sala → id do host */
 const roomHosts = new Map();
-
-/** @type {Map<string, Set<string>>} sala → ids mutados */
 const roomMuted = new Map();
 
 let nextId = 1;
@@ -34,7 +27,9 @@ function safeSend(ws, obj) {
 function peersInRoom(room, exceptId) {
   const list = [];
   for (const [id, c] of clients) {
-    if (c.room === room && id !== exceptId) list.push({ id, user: c.user });
+    if (c.room === room && id !== exceptId) {
+      list.push({ id, user: c.user, avatarId: c.avatarId });
+    }
   }
   return list;
 }
@@ -44,7 +39,7 @@ function presenceSnapshot() {
   for (const [id, c] of clients) {
     if (!c.room) continue;
     if (!presence[c.room]) presence[c.room] = [];
-    presence[c.room].push({ id, user: c.user });
+    presence[c.room].push({ id, user: c.user, avatarId: c.avatarId });
   }
   return presence;
 }
@@ -111,7 +106,6 @@ function leaveRoom(id, broadcast = true) {
   me.room = null;
   notifyRoom(prevRoom, id, { type: "peer-left", id });
 
-  // Remove da lista de mutados se estava
   const mutedSet = roomMuted.get(prevRoom);
   if (mutedSet) mutedSet.delete(id);
 
@@ -123,7 +117,13 @@ function leaveRoom(id, broadcast = true) {
 
 wss.on("connection", (ws) => {
   const id = String(nextId++);
-  clients.set(id, { ws, room: null, user: `User-${id}`, joinedAt: Date.now() });
+  clients.set(id, {
+    ws,
+    room: null,
+    user: `User-${id}`,
+    joinedAt: Date.now(),
+    avatarId: null,
+  });
 
   safeSend(ws, {
     type: "welcome",
@@ -149,6 +149,8 @@ wss.on("connection", (ws) => {
     if (msg.type === "join") {
       const room = String(msg.room || "").trim();
       const user = String(msg.user || "").trim() || `User-${id}`;
+      const avatarId = msg.avatarId ? String(msg.avatarId) : null;
+
       if (!room) return safeSend(ws, { type: "error", message: "room obrigatório" });
       if (room.length > 40) return safeSend(ws, { type: "error", message: "Nome da sala muito longo." });
 
@@ -160,12 +162,12 @@ wss.on("connection", (ws) => {
       me.room = room;
       me.user = user;
       me.joinedAt = Date.now();
+      me.avatarId = avatarId;
 
       if (isNewRoom || !roomHosts.get(room)) {
         roomHosts.set(room, id);
       }
 
-      // Garante que o Set de muted existe
       if (!roomMuted.has(room)) roomMuted.set(room, new Set());
       const isMuted = roomMuted.get(room).has(id);
 
@@ -183,10 +185,20 @@ wss.on("connection", (ws) => {
 
       safeSend(ws, { type: "chat-history", room, messages: getHistory(room) });
 
-      notifyRoom(room, id, { type: "peer-joined", id, user });
+      notifyRoom(room, id, { type: "peer-joined", id, user, avatarId });
       notifyRoom(room, id, { type: "host-changed", hostId: roomHosts.get(room) });
 
       console.log(`[+] ${user} (${id}) entrou em "${room}" (host: ${roomHosts.get(room)})`);
+      broadcastPresence();
+      return;
+    }
+
+    if (msg.type === "update-profile") {
+      const avatarId = msg.avatarId ? String(msg.avatarId) : null;
+      me.avatarId = avatarId;
+
+      console.log(`[update-profile] ${id} (${me.user}) → avatar: ${avatarId ?? "-"}`);
+
       broadcastPresence();
       return;
     }
@@ -226,8 +238,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ===== Comandos de host =====
-
     if (msg.type === "kick") {
       if (!me.room) return;
       if (roomHosts.get(me.room) !== id) {
@@ -246,7 +256,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // === Silenciar um peer específico (individual) ===
     if (msg.type === "mute-peer") {
       if (!me.room) return;
       if (roomHosts.get(me.room) !== id) {
@@ -263,7 +272,6 @@ wss.on("connection", (ws) => {
       else set.delete(targetId);
       roomMuted.set(me.room, set);
 
-      // Avisa todos os da sala (inclusive o mutado)
       notifyRoom(me.room, null, {
         type: "peer-muted",
         targetId,
@@ -273,7 +281,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // === Mute all (botão de toolbar) ===
     if (msg.type === "mute-all") {
       if (!me.room) return;
       if (roomHosts.get(me.room) !== id) {
@@ -289,7 +296,6 @@ wss.on("connection", (ws) => {
       }
       roomMuted.set(me.room, set);
 
-      // Avisa individualmente cada peer mutado
       for (const [otherId, c] of clients) {
         if (c.room === me.room && otherId !== id) {
           safeSend(c.ws, {
